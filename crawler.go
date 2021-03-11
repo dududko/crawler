@@ -3,6 +3,7 @@ package crawler
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"io/ioutil"
 	"log"
@@ -12,27 +13,96 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 )
 
-// // Result of Crawler
-type CrawlerResult struct {
-	Pages uint32
+func (c *crawler) Crawl(rootURL *url.URL) error {
+
+	if rootURL == nil {
+		return errors.New("Cannot crawl nil *url.URL")
+	}
+
+	// channel used to send to consumers the valid urls to be crawled
+	// 1. read by the consumers go-routines
+	// 2. written by the orchestrator go-routine
+	toCrawl := make(chan string)
+
+	// rawUrls channel containing the rawURLs to be scrapped, not all of them will actually be dispatched 
+	// 1. read by the orchestrator go-routine
+	// 2. written by the consumers go-routines
+	rawURLs := make(chan []string)
+
+	// termConsumers is a channel for signaling termination to consumers 
+	termConsumers := make(chan struct{})
+
+	// termOrchestrator is a channel for signaling termination to the orchestrator
+	termOrchestrator := make(chan struct{})
+
+	// consumersDone is a channel used by the consumer go-routine to signal a 
+	// timeout triggered by the absence of new ulr to be scrapped
+	consumersDone := make(chan struct{})
+	
+	// ongoingJobs is used to track the go-routines both in the consumers and the orchestrator side
+	var wgConsumers sync.WaitGroup
+	wgConsumers.Add(1)
+	go func(maxPoolSize uint32) {
+		defer wgConsumers.Done()
+		startConsumers(c.targetDir, maxPoolSize, toCrawl, rawURLs, termConsumers, consumersDone) 
+	}(c.maxPoolSize)
+
+	var wgOrchestrator sync.WaitGroup
+	wgOrchestrator.Add(1)
+	go func (rootURL *url.URL)  {
+		defer wgOrchestrator.Done()
+		startOrchestrator(rootURL.String(), toCrawl, rawURLs, termOrchestrator)
+	}(rootURL)
+
+	// launch first url to rawURLs channel
+	toCrawl <- rootURL.String()
+
+	// blocks until either the naturalEndOfWork or a context.cancel is issued
+	select {
+	case <-consumersDone:
+		log.Println("Natural termination due to no new workload requested")
+	case <-c.ctx.Done():
+		log.Println("Job Cancelled")
+	}
+
+	// signaling two terminations for consumer routine and for orchestration routine
+	termConsumers<-struct{}{}
+	wgConsumers.Wait()
+	termOrchestrator<-struct{}{}
+	wgOrchestrator.Wait()
+
+	close(rawURLs)
+	close(toCrawl)
+
+	return nil
 }
 
-// type crawler struct {
-// 	visited map[string]bool
-// 	raw chan string
-// 	toCrawl chan string
-// 	workerPoolSize uint32
-// 	ctx context.Context
-// }
+// Crawler crawls recursively a ulr passed in input
+// and return a CrawlerResult
+type Crawler interface {
+	// Crawl will crawl recursively all the pages under the provided url
+	// url must be a valid non-nil url otherwise an empty CrawlerResult and 
+	// an error will be returned.
+	// Different errors can also be returned (e.g. due to failure in HTTP GET)
+	Crawl(rootURL *url.URL) error
+}
 
-// func NewCrawler() Crawler {
-	
-// }
+type crawler struct {
+	ctx context.Context
+	targetDir string
+	maxPoolSize uint32
+}
 
-// func (c *crawler) Cancel() { }
-
+// NewCrawler returns a Crawler object  
+func NewCrawler(ctx context.Context, targetDir string, maxPoolSize uint32) Crawler {
+	return &crawler {
+		ctx, targetDir, maxPoolSize,
+	}
+}
 
 // parseLinksFromHTML retrieves all the links in the html string that satisfies:
 // 1. is an absolute path link and child of url 
@@ -64,6 +134,18 @@ func parseLinksFromHTML(pageURL *url.URL, html string) []string {
 	}
 
 	return links
+}
+
+// filterValidURLs return only the valid linkURLStrs tested against 
+// the rootURLStr and using the validLink method
+func filterValidURLs(rootURLStr string, linkURLStrs []string) []string {
+	validURLs := make([]string, 0)
+	for _, link := range linkURLStrs {
+		if validLink(rootURLStr, link) {
+			validURLs = append(validURLs, link)
+		}
+	}
+	return validURLs
 }
 
 // validLink returns true if
@@ -111,10 +193,11 @@ func downloadHTMLAndRetrieveLinks(urlStr, dirPath string) ([]string, error) {
 
 	// generate local path
 	filepath := dirPath
-	if ! strings.HasSuffix(dirPath, "/") {
+	if ! strings.HasSuffix(filepath, "/") {
 		filepath = filepath + "/"
 	}
 	filepath = filepath + pageURL.Path
+	log.Printf("Downloading file [%v] into filepath [%v]", urlStr, filepath)
 
 	// retrieve bytes from url
 	resp, err := http.Get(urlStr)
@@ -130,6 +213,12 @@ func downloadHTMLAndRetrieveLinks(urlStr, dirPath string) ([]string, error) {
 
 	links = append(links, parseLinksFromHTML(pageURL, string(bodyBytes))...)
 
+	// ensure parent dir exists
+	dir := path.Dir(filepath)
+	err = os.MkdirAll(dir, 0755)
+	if err != nil {
+		return links, err
+	}
 	// create file (truncates if file already exist)
 	f, err := os.Create(filepath)
 	if err != nil {
@@ -143,46 +232,90 @@ func downloadHTMLAndRetrieveLinks(urlStr, dirPath string) ([]string, error) {
 }
 
 // downloads the URL and search for references inside 
-func workerJob(url string, rawUrls chan<- string) {
-
+func workerJob(targetDir string, linkURL string, rawUrls chan<- []string) {
+	linksList, err := downloadHTMLAndRetrieveLinks(linkURL, targetDir)
+	if err != nil {
+		log.Printf("Error while downloading and Retrieving links: %v\n", err)
+		return 
+	}
+	if len(linksList) > 0 {
+		rawUrls <- linksList
+	}
 }
 
-func startConsumers(ctx context.Context, workerPoolSize uint32, toCrawl <-chan string, rawUrls chan<- string) {
+// startOrchestrator will listen to 'rawURLs' channel and validate the set of incoming
+// urls against the configured rootURL. The valid URLs will then be 'enqueued' into the
+// 'toCrawl' channel for being processed by the workers. 
+// rootURL is the first url requested for scrapping which will actually be recursively scrapped
+// toCrawl is the channel where this orchestrator go-routine will enqueue urls that are eligible to be enqueued
+// rawURLs is the channel where the orchestrator go-routine dequeue candidate urls to be enqueued 
+// term channel is used to shut down the orchestrator go-routine
+func startOrchestrator(rootURL string, toCrawl chan<- string, rawURLs <-chan []string, term <-chan struct{}) {
 
-	// semaphore regulates maximum amount of go routines 
-	// that can be created 
-	sem := make(chan bool, workerPoolSize)
-
+	crawledURLs := make(map[string]bool)
 	for {
 		select {
-		case url := <-toCrawl:
-			sem <- true // if more than "workerPoolSize" routines are in use this will block
-			go func(url string, rawUrls chan<- string) {
-				workerJob(url, rawUrls)
-				<-sem
-			}(url, rawUrls)
+		case candidateURLs := <-rawURLs: 
+			validURLs := filterValidURLs(rootURL, candidateURLs)
+
+			for _, validURL := range validURLs {
+				_, found := crawledURLs[validURL]
+				if ! found {
+					crawledURLs[validURL] = true
+					log.Printf("Enqueuing url: [%v]", validURL)
+					toCrawl<- validURL
+				}
+			}
+		case <-term:
+			log.Println("End of orchestrator routine")
+			return
 		}
 	}
 }
 
- 
-// func (c *crawler) Crawl(ulr string) (CrawlerResult, error) {
+// startConsumers will listen to the 'toCrawl' channel and spawn a go-routine for each
+// new url incoming into this channel. This spawned go-routine will download the incoming
+// url and enqueue in the 'rawURLs' the list of ulrs found within the page. those ulrs are 
+// only candidates urls and will be processed by the orchestrator go-routine which will 
+// arbitrate whether or not this candidate url will be crawled.
+// If no incoming task is dispatched to this consumer go-routine within 10 milliseconds it will 
+// signal that the consumming job is done by enqueuing into the 'consumerDone' channel
+// finally the 'term' channel is used externally to cancell and terminate this go-routine
+// targetDir is the target dir where the consumers will dowload the urls into
+// workerPoolSize is the amount of maximum concurrent go-routines that can be spawned by the consumer go-routine
+// toCrawl is the channel where incoming url to be scraped are dequeued from
+// rawURLs is the channel where the candidate urls to be scraped are enqueued
+// term is the channel used to terminate the consumer go-routines
+// consumerDone is the channel used by the consumer go-routine to signal that the scrapping is done - this is triggered if no job is received in the 'toCrawl' channel within
+//              a timeout of 10 milliseconds
+func startConsumers(targetDir string, workerPoolSize uint32, toCrawl <-chan string, rawURLs chan<- []string, term <-chan struct{}, consumersDone chan<- struct{}) {
 
-    
-//     // Start [workerPoolSize] workers
-//     for i := 0; i < c.workerPoolSize; i++ {
-//         go workerJob(c.ctx, c.toCrawl, c.raw)
-//     }
-
-    
-//     wg.Wait()     // wait for all workers to be done
-//     fmt.Println("Workers done, shutting down!")
-// }
-
-// Crawler crawls recursively a ulr passed in input
-// and return a CrawlerResult
-type Crawler interface {
-	Crawl(ulr string) (CrawlerResult, error)
-	// Cancel cancels the crawling
-	Cancel() 
+	// sem is used as a semaphore to regulates maximum amount of go routines 
+	// that can be created concurrently
+	// if workerPoolSize is set to 0 there will be no limit of go-routines
+	var sem chan struct{}
+	if workerPoolSize == 0 {
+		sem = make(chan struct{})
+	} else {
+		sem = make(chan struct{}, workerPoolSize)
+	}
+	var wg sync.WaitGroup
+	for {
+		select {
+		case <-time.After(10*time.Millisecond):
+			consumersDone <- struct{}{}
+		case urlToCrawl := <-toCrawl:
+			sem <- struct{}{}// if more than "workerPoolSize" routines are in use this will block until one is availlable
+			wg.Add(1)
+			go func(targetDir string, linkURL string, rawURLs chan<- []string) {
+				workerJob(targetDir, linkURL, rawURLs)
+				defer wg.Done() // free the go-routine and free the waiting group
+				<-sem 	// free slot in pool
+			}(targetDir, urlToCrawl, rawURLs)
+		case <-term:
+			log.Println("End of consumer routine")
+			wg.Wait()
+			return
+		}
+	}
 }

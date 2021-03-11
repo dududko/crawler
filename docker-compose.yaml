@@ -6,7 +6,7 @@ services:
     depends_on:
       - site
     environment:
-      - CRAWLER_BASE_URL=http://site:8080/index.html
+      - CRAWLER_BASE_URL=http://site:8080/
   site:
     build: test_data
     ports:
