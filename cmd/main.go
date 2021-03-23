@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/rbroggi/crawler"
 )
@@ -38,6 +39,10 @@ func main() {
 		select {
 		case <-c:
 			cancel()
+			log.Println("Kill")
+			time.Sleep(5 * time.Second)
+			log.Println("Kill after 5s")
+			os.Exit(1)
 		case <-ctx.Done():
 		}
 	}()

@@ -14,7 +14,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"time"
 )
 
 func (c *crawler) Crawl(rootURL *url.URL) error {
@@ -71,12 +70,16 @@ func (c *crawler) Crawl(rootURL *url.URL) error {
 
 	// signaling two terminations for consumer routine and for orchestration routine
 	termConsumers<-struct{}{}
+	log.Println("w8 consumers")
 	wgConsumers.Wait()
 	termOrchestrator<-struct{}{}
+	log.Println("w8 orchestrator")
 	wgOrchestrator.Wait()
 
 	close(rawURLs)
 	close(toCrawl)
+
+	log.Println("exit crawler")
 
 	return nil
 }
@@ -192,11 +195,7 @@ func downloadHTMLAndRetrieveLinks(urlStr, dirPath string) ([]string, error) {
 	}
 
 	// generate local path
-	filepath := dirPath
-	if ! strings.HasSuffix(filepath, "/") {
-		filepath = filepath + "/"
-	}
-	filepath = filepath + pageURL.Path
+	filepath := path.Join(dirPath, pageURL.Path)
 	log.Printf("Downloading file [%v] into filepath [%v]", urlStr, filepath)
 
 	// retrieve bytes from url
@@ -214,13 +213,12 @@ func downloadHTMLAndRetrieveLinks(urlStr, dirPath string) ([]string, error) {
 	links = append(links, parseLinksFromHTML(pageURL, string(bodyBytes))...)
 
 	// ensure parent dir exists
-	dir := path.Dir(filepath)
-	err = os.MkdirAll(dir, 0755)
+	err = os.MkdirAll(filepath, 0755)
 	if err != nil {
 		return links, err
 	}
 	// create file (truncates if file already exist)
-	f, err := os.Create(filepath)
+	f, err := os.Create(path.Join(filepath, "index.html"))
 	if err != nil {
 		return links, err
 	}
@@ -232,15 +230,13 @@ func downloadHTMLAndRetrieveLinks(urlStr, dirPath string) ([]string, error) {
 }
 
 // downloads the URL and search for references inside 
-func workerJob(targetDir string, linkURL string, rawUrls chan<- []string) {
-	linksList, err := downloadHTMLAndRetrieveLinks(linkURL, targetDir)
+func workerJob(targetDir string, linkURL string, rawUrls chan<- []string) (res []string) {
+	res, err := downloadHTMLAndRetrieveLinks(linkURL, targetDir)
 	if err != nil {
 		log.Printf("Error while downloading and Retrieving links: %v\n", err)
-		return 
+		return
 	}
-	if len(linksList) > 0 {
-		rawUrls <- linksList
-	}
+	return
 }
 
 // startOrchestrator will listen to 'rawURLs' channel and validate the set of incoming
@@ -253,9 +249,11 @@ func workerJob(targetDir string, linkURL string, rawUrls chan<- []string) {
 func startOrchestrator(rootURL string, toCrawl chan<- string, rawURLs <-chan []string, term <-chan struct{}) {
 
 	crawledURLs := make(map[string]bool)
+Loop:
 	for {
 		select {
-		case candidateURLs := <-rawURLs: 
+		case candidateURLs := <-rawURLs:
+			log.Println("read from row urls", candidateURLs)
 			validURLs := filterValidURLs(rootURL, candidateURLs)
 
 			for _, validURL := range validURLs {
@@ -263,12 +261,18 @@ func startOrchestrator(rootURL string, toCrawl chan<- string, rawURLs <-chan []s
 				if ! found {
 					crawledURLs[validURL] = true
 					log.Printf("Enqueuing url: [%v]", validURL)
-					toCrawl<- validURL
+					select {
+						case toCrawl<- validURL:
+						case <-term:
+							log.Println("End of orchestrator routine")
+							break Loop
+					}
 				}
 			}
+			log.Println("continue loop")
 		case <-term:
 			log.Println("End of orchestrator routine")
-			return
+			break Loop
 		}
 	}
 }
@@ -300,22 +304,34 @@ func startConsumers(targetDir string, workerPoolSize uint32, toCrawl <-chan stri
 		sem = make(chan struct{}, workerPoolSize)
 	}
 	var wg sync.WaitGroup
+Loop:
 	for {
 		select {
-		case <-time.After(10*time.Millisecond):
-			consumersDone <- struct{}{}
+		//case <-time.After(10*time.Millisecond):
+		//	consumersDone <- struct{}{}
 		case urlToCrawl := <-toCrawl:
 			sem <- struct{}{}// if more than "workerPoolSize" routines are in use this will block until one is availlable
 			wg.Add(1)
 			go func(targetDir string, linkURL string, rawURLs chan<- []string) {
-				workerJob(targetDir, linkURL, rawURLs)
-				defer wg.Done() // free the go-routine and free the waiting group
-				<-sem 	// free slot in pool
+				defer func() {
+					log.Println("exit worker")
+					wg.Done() // free the go-routine and free the waiting group
+					<-sem 	// free slot in pool
+					log.Println("exit worker wone")
+				}()
+				res := workerJob(targetDir, linkURL, rawURLs)
+				if len(res) > 0 {
+					select {
+					case rawURLs <- res:
+					case <-term:
+						return
+					}
+				}
 			}(targetDir, urlToCrawl, rawURLs)
 		case <-term:
 			log.Println("End of consumer routine")
 			wg.Wait()
-			return
+			break Loop
 		}
 	}
 }
